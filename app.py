@@ -1,122 +1,81 @@
-import os
-import time
-import uuid
-import json
 from flask import Flask, request, jsonify
-import google.generativeai as genai
+import requests
+import fitz
+import json
+from groq import Groq
+import os
 
 app = Flask(__name__)
 
-
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-MODEL_NAME = "gemini-2.5-flash"
+client = Groq(api_key="grok_api")
 
 
-SESSIONS = {}
+# =========================
+# استخراج النص من PDF
+# =========================
+def extract_text_from_pdf(url):
+    response = requests.get(url)
+
+    if response.status_code != 200:
+        raise Exception("Failed to download PDF")
+
+    pdf_bytes = response.content
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    text = ""
+    for page in doc:
+        text += page.get_text()
+
+    doc.close()
+    return text
 
 
-def upload_to_gemini(file_storage):
-    tmp_path = f"/tmp/{uuid.uuid4()}.pdf"
-    file_storage.save(tmp_path)
+# =========================
+# تحليل النص طبياً
+# =========================
+def analyze_medical_case(medical_text):
 
-    f = genai.upload_file(tmp_path)
-    while f.state.name == "PROCESSING":
-        time.sleep(2)
-        f = genai.get_file(f.name)
+    prompt = f"""
+Analyze the medical case and return JSON.
 
-    os.remove(tmp_path)
-    return f
+Case:
+{medical_text}
+"""
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {"role": "system", "content": "Return only valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        model="llama-3.3-70b-versatile",
+        temperature=0.1,
+        response_format={"type": "json_object"}
+    )
+
+    return json.loads(chat_completion.choices[0].message.content)
 
 
+# =========================
+# API Endpoint
+# =========================
 @app.route("/analyze", methods=["POST"])
 def analyze():
 
-    medical = request.files.get("medical")
-    lab = request.files.get("lab")
-    radiology = request.files.get("radiology")
-
-    if not medical or not lab or not radiology:
-        return jsonify({"error": "All files are required"}), 400
-
-    medical_f = upload_to_gemini(medical)
-    lab_f = upload_to_gemini(lab)
-    radiology_f = upload_to_gemini(radiology)
-
-    analysis_prompt = """
-You are a senior clinical decision-support AI.
-
-Return ONLY valid JSON in this format:
-{
-  "high_priority_alerts": [],
-  "low_priority_alerts": [],
-  "current_diagnoses": [],
-  "critical_allergies": [],
-  "ai_insight": [],
-  "ai_summary": [],
-  "likely_diagnoses": {
-    "high_likelihood": [],
-    "possible": [],
-    "low_likelihood": []
-  }
-}
-"""
-
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config={
-            "temperature": 0.1,
-            "response_mime_type": "application/json"
-        }
-    )
-
-    response = model.generate_content(
-        [analysis_prompt, medical_f, lab_f, radiology_f]
-    )
-
-    analysis_json = json.loads(response.text)
-
-    # نعمل session للمريض
-    session_id = str(uuid.uuid4())
-
-    chat_model = genai.GenerativeModel(
-        MODEL_NAME,
-        generation_config={"temperature": 0}
-    )
-
-    chat = chat_model.start_chat(
-        history=[{
-            "role": "user",
-            "parts": [medical_f, lab_f, radiology_f]
-        }]
-    )
-
-    SESSIONS[session_id] = chat
-
-    return jsonify({
-        "session_id": session_id,
-        "analysis": analysis_json
-    })
-
-@app.route("/chat", methods=["POST"])
-def chat():
     data = request.json
-    session_id = data.get("session_id")
-    question = data.get("question")
+    file_url = data.get("file_url")
 
-    if not session_id or not question:
-        return jsonify({"error": "session_id and question are required"}), 400
+    if not file_url:
+        return jsonify({"error": "file_url is required"}), 400
 
-    chat = SESSIONS.get(session_id)
-    if not chat:
-        return jsonify({"error": "Invalid session_id"}), 400
+    try:
+        text = extract_text_from_pdf(file_url)
+        result = analyze_medical_case(text)
+        return jsonify(result)
 
-    response = chat.send_message(question)
-
-    return jsonify({
-        "answer": response.text
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/", methods=["GET"])
-def health():
-    return "API is running ✅"
+# تشغيل السيرفر
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
